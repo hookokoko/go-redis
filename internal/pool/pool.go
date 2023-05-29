@@ -252,22 +252,25 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 
 	for {
 		p.connsMu.Lock()
+		// 尝试p.idleConns中拿到一个连接
 		cn, err := p.popIdle()
 		p.connsMu.Unlock()
 
 		if err != nil {
 			return nil, err
 		}
-
+		// 没有取到连接，终止循环，在下面的逻辑中新建一个连接
 		if cn == nil {
 			break
 		}
-
+		// 检查连接是否有效，如果无效就关闭它，继续下一轮循环
+		// 这里会不会有效率问题
 		if !p.isHealthyConn(cn) {
 			_ = p.CloseConn(cn)
 			continue
 		}
 
+		// 当拿到一个健康的可用连接，就增减Hits计数
 		atomic.AddUint32(&p.stats.Hits, 1)
 		return cn, nil
 	}
@@ -275,6 +278,8 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 	atomic.AddUint32(&p.stats.Misses, 1)
 
 	newcn, err := p.newConn(ctx, true)
+	// 如果获取连接失败，则重新腾出p.queue的一个位置
+	// 这里的p.queue中的位置是在waitTurn()中占用的
 	if err != nil {
 		p.freeTurn()
 		return nil, err
@@ -284,34 +289,44 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 }
 
 func (p *ConnPool) waitTurn(ctx context.Context) error {
+	// 超时检测
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 	}
 
+	// queue可以认为是一个大小为pool size的token池，当这个chan还能写入则return
 	select {
 	case p.queue <- struct{}{}:
 		return nil
 	default:
 	}
 
+	// p.queue满了会到这里
+	// 设置一个定时器来等待p.queue 空余位置的释放，等待的超时时间是PoolTimeout
 	timer := timers.Get().(*time.Timer)
 	timer.Reset(p.cfg.PoolTimeout)
 
 	select {
+	// 再次检测一下超时
 	case <-ctx.Done():
+		// 这里的作用是停止计时器，当timer.Stop()返回的值是false说明计时还没到期，所以要执行下<-timer.C,让这个时间值被读出
 		if !timer.Stop() {
 			<-timer.C
 		}
+		// 重新将timer放入timer pool
 		timers.Put(timer)
 		return ctx.Err()
+	// 此时p.queue有空余位置了
 	case p.queue <- struct{}{}:
+		// 同上停止计时
 		if !timer.Stop() {
 			<-timer.C
 		}
 		timers.Put(timer)
 		return nil
+	// 到时间了，放入timer pool
 	case <-timer.C:
 		timers.Put(timer)
 		atomic.AddUint32(&p.stats.Timeouts, 1)

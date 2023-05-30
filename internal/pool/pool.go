@@ -246,6 +246,8 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 		return nil, ErrClosed
 	}
 
+	// 等待获取token。如果拿不到说明池子里的连接都在用着了。
+	// 需要有一定的等待策略去拿
 	if err := p.waitTurn(ctx); err != nil {
 		return nil, err
 	}
@@ -289,7 +291,7 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 }
 
 func (p *ConnPool) waitTurn(ctx context.Context) error {
-	// 超时检测
+	//超时检测, 这个只会执行一次，我认为没有必要加上了
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
